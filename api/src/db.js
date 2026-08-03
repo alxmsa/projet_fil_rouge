@@ -33,4 +33,31 @@ function query(text, params) {
   return pool.query(text, params);
 }
 
-module.exports = { pool, query };
+/**
+ * Au démarrage, le conteneur Postgres peut ne pas encore accepter de
+ * connexions : `depends_on` (sans condition) ne garantit que l'ordre de
+ * *lancement* des conteneurs, pas que Postgres soit prêt à cet instant.
+ * On retente avec un backoff simple plutôt que de laisser le process
+ * planter en boucle (crash-loop observé au premier `docker compose up`).
+ */
+async function waitForDb({ retries = 10, delayMs = 2000 } = {}) {
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      await pool.query('SELECT 1');
+      console.log('[db] connexion PostgreSQL établie');
+      return;
+    } catch (err) {
+      console.warn(
+        `[db] tentative ${attempt}/${retries} échouée (${err.code || err.message}), nouvelle tentative dans ${delayMs}ms`
+      );
+      if (attempt === retries) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+async function closePool() {
+  await pool.end();
+}
+
+module.exports = { pool, query, waitForDb, closePool };
