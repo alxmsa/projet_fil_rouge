@@ -2,7 +2,7 @@
 
 API REST de gestion de tâches (CRUD complet), démarrée ce matin comme un "hello"
 Node.js dockerisé à la truelle, et transformée au fil de la journée en une
-petite stack conteneurisée complète : API Node/Express + PostgreSQL persistant
+petite stack conteneurisée complète et redéployable : API Node/Express + PostgreSQL persistant
 + service de statistiques Python, réseau isolé, configuration 100% externalisée,
 images publiées sur un registry.
 
