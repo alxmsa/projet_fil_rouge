@@ -1,0 +1,29 @@
+# Secrets / config locale
+.env
+.env.local
+*.env
+!.env.example
+
+# Dépendances
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Tests / couverture
+coverage/
+.nyc_output/
+.pytest_cache/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Éditeurs / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Docker
+*.pid
