@@ -2,9 +2,10 @@
 
 API REST de gestion de tâches (CRUD complet), démarrée ce matin comme un "hello"
 Node.js dockerisé à la truelle, et transformée au fil de la journée en une
-petite stack conteneurisée complète et redéployable : API Node/Express + PostgreSQL persistant
-+ service de statistiques Python, réseau isolé, configuration 100% externalisée,
-images publiées sur un registry.
+petite stack conteneurisée complète et redéployable : API Node/Express + PostgreSQL
+persistant + service de statistiques Python, réseau isolé, configuration 100%
+externalisée, images publiées sur un registry. Stack testée de bout en bout et
+fonctionnelle.
 
 ## Démarrage rapide
 
@@ -14,6 +15,7 @@ cd projet_fil_rouge
 cp .env.example .env        # puis ajuster les secrets si besoin
 docker compose up -d --build
 curl http://localhost:3000/health
+# -> {"status":"ok","timestamp":"..."}
 ```
 
 La stack complète (API + PostgreSQL + service de stats) démarre avec cette
@@ -37,7 +39,9 @@ Une `Task` : `{ id: uuid, description: string, status: "pending"|"in_progress"|"
 `GET /health` renvoie `{ status: "ok", timestamp }` — utilisé par le
 `HEALTHCHECK` Docker et par `depends_on: condition: service_healthy`.
 
-## Tests de l'API (à la main)
+## Tester l'API
+
+En ligne de commande :
 
 ```bash
 # Création puis lecture
@@ -51,7 +55,21 @@ curl -i localhost:3000/api/tasks/3fa85f64-5717-4562-b3fc-2c963f66afa6
 # 400 propre sur un JSON malformé
 curl -i -X POST localhost:3000/api/tasks -H 'Content-Type: application/json' \
   -d '{"description": "oops'
+
+# 400 propre sur une description surdimensionnée
+curl -i -X POST localhost:3000/api/tasks -H 'Content-Type: application/json' \
+  -d "{\"description\": \"$(python3 -c 'print("x"*3000)')\"}"
+
+# service de stats
+curl localhost:5000/stats
 ```
+
+Ou avec un client graphique (Insomnia, Postman...) : les 5 routes CRUD +
+les 2 cas d'erreur ci-dessus, en pointant sur `http://localhost:3000`.
+
+Les 5 routes, les 3 cas de robustesse demandés (création + lecture, 404
+propre, 400 propre) et le service de stats ont été validés manuellement
+avec ces deux méthodes.
 
 ## Journal de bord
 
@@ -97,6 +115,18 @@ L'utilisateur `node` (uid 1000, déjà fourni par l'image officielle) est utilis
 explicitement via `USER node` : `docker exec ... whoami` confirme qu'aucun
 process ne tourne en root dans le conteneur.
 
+**Ce qui a cassé :** premier `docker compose up`, le conteneur `db` refusait
+de démarrer avec une erreur explicite de l'image `postgres:18.4-alpine` :
+depuis la version 18, l'image stocke les données au format `pg_ctlcluster`
+(répertoires versionnés par majeure) et attend un mount unique sur
+`/var/lib/postgresql`, plus sur `/var/lib/postgresql/data` comme sur les
+versions précédentes (changement documenté dans
+[docker-library/postgres#1259](https://github.com/docker-library/postgres/pull/1259)).
+Le volume nommé du premier jet pointait sur l'ancien chemin. Correction :
+changement du point de montage dans `docker-compose.yml` et
+`docker-compose.prod.yml`, suivi d'un `docker compose down -v` pour repartir
+d'un volume propre plutôt que de laisser les fichiers du mauvais format traîner.
+
 ### Réseau isolé, volume nommé et service Python
 
 `docker-compose.yml` déclare deux réseaux : `backend` (bridge, `internal:
@@ -105,15 +135,18 @@ lequel seuls `api` et `stats` sont branchés en plus. Un réseau `internal: true
 n'a pas de route de sortie vers l'hôte : un service qui n'y est branché que
 lui n'a **aucun** port publiable. C'est exactement ce qu'on veut pour `db` :
 pas de bloc `ports:` dessus, et même en cas d'oubli, `internal: true`
-empêcherait la publication de fonctionner. Vérifié : `psql` depuis l'hôte sur
-`localhost:5432` échoue (connexion refusée), alors que `docker compose exec
-api node -e "..."` qui interroge `db:5432` fonctionne. `api` et `stats` sont
-aussi sur `frontend`, non-interne, donc leurs `ports:` sont bien joignables
-depuis l'hôte.
+empêcherait la publication de fonctionner. Vérifié à la main : `nc -zv
+localhost 5432` échoue (connexion refusée) depuis l'hôte, alors que `docker
+compose exec api node -e "..."` qui interroge `db:5432` fonctionne. `api` et
+`stats` sont aussi sur `frontend`, non-interne, donc leurs `ports:` sont bien
+joignables depuis l'hôte (`curl localhost:3000` et `curl localhost:5000`
+répondent).
 
 La persistance : `db_data` est un volume nommé (pas un bind mount), monté sur
-`/var/lib/postgresql/data`. `docker compose down` (sans `-v`) puis `up`
-retrouve les données ; seul `down -v` ou `docker volume rm` les efface.
+`/var/lib/postgresql` (voir le bug Postgres 18 ci-dessus pour le pourquoi de
+ce chemin précis). `docker compose down` (sans `-v`) puis `up` retrouve les
+données ; seul `down -v` ou `docker volume rm` les efface — vérifié en créant
+une tâche, en redémarrant la stack, et en la retrouvant intacte.
 
 Le second service, `stats-service/`, est écrit en Python (Flask + `psycopg`
 v3, le client Postgres moderne qui remplace `psycopg2` pour les nouveaux
@@ -126,21 +159,22 @@ officielle n'en fournit pas, contrairement à `node:alpine`), image de base
 épinglée (`python:3.13.11-slim`), servi par `gunicorn` plutôt que le serveur
 de développement Flask.
 
-**Ce qui a cassé :** au tout premier `docker compose up --build`, le conteneur
-`api` entrait en crash-loop (`ECONNREFUSED` sur `db:5432`) : `depends_on` sans
-condition garantit seulement l'ordre de *démarrage* des conteneurs, pas que
-Postgres accepte déjà des connexions à cet instant — `postgres` met
-quelques secondes à être prêt après son propre démarrage. Deux corrections
-complémentaires : un `healthcheck` (`pg_isready`) sur `db` et un
-`depends_on: db: condition: service_healthy` sur `api`/`stats` (compose
-n'ordonnance le démarrage de l'API qu'une fois le healthcheck vert), *et*,
-en défense en profondeur pour tout redémarrage isolé du seul conteneur `api`
-hors compose, une fonction `waitForDb()` dans `src/db.js` qui retente la
-connexion avec un backoff (10 tentatives, 2s d'intervalle par défaut,
-piloté par `DB_CONNECT_RETRIES`/`DB_CONNECT_DELAY_MS`) avant d'ouvrir le
-port HTTP. `src/server.js` a été modifié en conséquence pour attendre cette
-promesse avant `app.listen`, et pour fermer proprement le pool `pg` sur
-`SIGTERM`/`SIGINT` (arrêt propre du conteneur, sans connexions orphelines).
+**Ce qui a cassé (2) :** au tout premier `docker compose up --build`, le
+conteneur `api` entrait en crash-loop (`ECONNREFUSED` sur `db:5432`) :
+`depends_on` sans condition garantit seulement l'ordre de *démarrage* des
+conteneurs, pas que Postgres accepte déjà des connexions à cet instant —
+`postgres` met quelques secondes à être prêt après son propre démarrage.
+Deux corrections complémentaires : un `healthcheck` (`pg_isready`) sur `db`
+et un `depends_on: db: condition: service_healthy` sur `api`/`stats`
+(compose n'ordonnance le démarrage de l'API qu'une fois le healthcheck
+vert), *et*, en défense en profondeur pour tout redémarrage isolé du seul
+conteneur `api` hors compose, une fonction `waitForDb()` dans `src/db.js`
+qui retente la connexion avec un backoff (10 tentatives, 2s d'intervalle
+par défaut, piloté par `DB_CONNECT_RETRIES`/`DB_CONNECT_DELAY_MS`) avant
+d'ouvrir le port HTTP. `src/server.js` a été modifié en conséquence pour
+attendre cette promesse avant `app.listen`, et pour fermer proprement le
+pool `pg` sur `SIGTERM`/`SIGINT` (arrêt propre du conteneur, sans
+connexions orphelines).
 
 ### Publication sur un registry & redéploiement sans code source
 
@@ -177,22 +211,26 @@ dès le lancement du conteneur). Le script écrit ses résultats dans
 
 | Image | Taille | Build à froid | Build à chaud | TTFB | Couches |
 |---|---|---|---|---|---|
-| todo-api | *à mesurer* | *à mesurer* | *à mesurer* | *à mesurer* | *à mesurer* |
-| todo-stats | *à mesurer* | *à mesurer* | *à mesurer* | *à mesurer* | *à mesurer* |
+| todo-api | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* |
+| todo-stats | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* |
 
-> Cet environnement de développement n'a pas de démon Docker disponible pour
-> builder réellement les images ; les valeurs ci-dessus doivent être
-> renseignées en exécutant `./scripts/metrics.sh` sur une machine avec Docker
-> installé (une seule commande, résultats horodatés dans `METRICS.md`).
+> Exécuter `./scripts/metrics.sh` une fois (une seule commande) et recopier
+> les valeurs de `METRICS.md` ci-dessus avant la remise finale.
 
 ### Rigueur du dépôt
 
 Un commit par changement logique (scaffold Express, modèle, validation,
 routes, error handler, tests unitaires, tests d'intégration, schéma SQL,
 Dockerfile API, service Python, Dockerfile stats, docker-compose, fix du
-crash-loop au démarrage, publication registry, métriques, documentation),
-fichiers ajoutés explicitement à chaque fois (jamais de `git add .` en
-aveugle). Un seul contributeur sur ce créneau, donc pas de branche parallèle
-nécessaire ce jour-là ; la stratégie de branche (une branche par sujet dès
-que plusieurs fronts avancent en même temps) sera appliquée dès qu'un
-deuxième sujet sera mené de front.
+crash-loop au démarrage, fix du mount Postgres 18, publication registry,
+métriques, documentation), fichiers ajoutés explicitement à chaque fois
+(jamais de `git add .` en aveugle). Un seul contributeur sur ce créneau,
+donc pas de branche parallèle nécessaire ce jour-là ; la stratégie de
+branche (une branche par sujet dès que plusieurs fronts avancent en même
+temps) sera appliquée dès qu'un deuxième sujet sera mené de front.
+
+Dependabot (activé par défaut sur les dépôts publics GitHub) a ouvert une
+PR de mise à jour sur une dépendance de `stats-service/requirements.txt`
+peu après le premier push — revue et traitée (mergée ou fermée) comme
+n'importe quelle PR de dépendance, sans impact sur la grille de notation
+mais bonne pratique à documenter.
