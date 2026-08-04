@@ -1,60 +1,100 @@
 #!/usr/bin/env bash
-# Mesure les métriques demandées par la grille de notation :
+# Mesure les métriques demandées par la grille de notation, via docker compose
+# (même mécanisme que la stack réelle, donc les variables d'env/réseau sont
+# correctes) :
 #   - taille de chaque image
 #   - temps de build à froid et à chaud
 #   - temps jusqu'à la première réponse HTTP
 #   - nombre de couches de chaque Dockerfile
 #
+# Compatible avec le Bash 3.2 fourni par défaut sur macOS (pas de tableaux
+# associatifs, pas de fonctionnalités Bash 4+).
+#
+# Prérequis : lancer ce script depuis la racine du repo, avec `db` déjà
+# démarré et healthy (`docker compose up -d db`).
 # Usage : ./scripts/metrics.sh
-# Nécessite : docker, curl, bc. À exécuter à la racine du dépôt.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 RESULTS_FILE="$ROOT_DIR/METRICS.md"
 
-declare -A CONTEXTS=(
-  [todo-api]="$ROOT_DIR/api"
-  [todo-stats]="$ROOT_DIR/stats-service"
-)
+# Charge .env pour que API_PORT/STATS_PORT reflètent ce que docker compose
+# utilise réellement (sinon le script reste bloqué sur les valeurs par défaut).
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
 
-now_ms() { date +%s%3N; }
+now_ms() {
+  # `date +%N` n'existe pas sur macOS (BSD date) : on passe par python3,
+  # disponible partout, pour obtenir un timestamp en millisecondes portable.
+  python3 -c 'import time; print(int(time.time() * 1000))'
+}
+
+echo "==> vérification que 'db' est en ligne (prérequis)"
+docker compose up -d db >/dev/null
+for _ in $(seq 1 30); do
+  status=$(docker compose ps db --format '{{.Health}}' 2>/dev/null || echo "")
+  if [ "$status" = "healthy" ]; then
+    break
+  fi
+  sleep 1
+done
 
 build_time() {
-  local image="$1" context="$2"
+  local service="$1"
   local start end
   start=$(now_ms)
-  docker build -t "$image:metrics" "$context" >/tmp/build-"$image".log 2>&1
+  docker compose build "$service" >/tmp/build-"$service".log 2>&1
   end=$(now_ms)
   echo $((end - start))
 }
 
 image_size_human() {
-  docker images "$1:metrics" --format '{{.Size}}'
+  docker images "$1" --format '{{.Size}}'
 }
 
 layer_count() {
-  # Nombre de couches réellement empilées dans le RootFS de l'image finale,
-  # plus fiable que `docker history | wc -l` (qui inclut les lignes <missing>
-  # correspondant à des instructions sans nouvelle couche, ex. ENV/LABEL).
-  docker inspect "$1:metrics" --format '{{len .RootFS.Layers}}'
+  docker inspect "$1" --format '{{len .RootFS.Layers}}'
 }
 
 ttfb() {
-  local image="$1" port="$2" health_path="${3:-/health}"
-  local container_id start elapsed
-  container_id=$(docker run -d --rm -p "$port:$port" -e PORT="$port" "$image:metrics")
+  local service="$1" url="$2"
+  docker compose stop "$service" >/dev/null 2>&1 || true
+  docker compose rm -f "$service" >/dev/null 2>&1 || true
+  local start
   start=$(now_ms)
-  # On sonde jusqu'à obtenir un 200, timeout à 30s.
-  for _ in $(seq 1 300); do
-    if curl -sf -o /dev/null "http://127.0.0.1:$port$health_path"; then
-      break
+  docker compose up -d "$service" >/dev/null
+  local i
+  for i in $(seq 1 600); do   # jusqu'à 60s de marge
+    if curl -sf -o /dev/null "$url"; then
+      echo $(( $(now_ms) - start ))
+      return
     fi
     sleep 0.1
   done
-  elapsed=$(( $(now_ms) - start ))
-  docker stop "$container_id" >/dev/null
-  echo "$elapsed"
+  echo "timeout"
+}
+
+measure_service() {
+  local service="$1" image="$2" url="$3"
+
+  echo "==> $service : purge du cache de build (mesure à froid)"
+  docker builder prune -af >/dev/null
+
+  local cold_ms warm_ms size layers ttfb_ms
+  cold_ms=$(build_time "$service")
+  warm_ms=$(build_time "$service")
+  size=$(image_size_human "$image")
+  layers=$(layer_count "$image")
+  ttfb_ms=$(ttfb "$service" "$url")
+
+  echo "| $image | $size | ${cold_ms}ms | ${warm_ms}ms | ${ttfb_ms}ms | $layers |" >> "$RESULTS_FILE"
+  echo "    taille=$size froid=${cold_ms}ms chaud=${warm_ms}ms ttfb=${ttfb_ms}ms couches=$layers"
 }
 
 echo "# Mesures brutes ($(date -u +%Y-%m-%dT%H:%M:%SZ))" > "$RESULTS_FILE"
@@ -62,28 +102,9 @@ echo "" >> "$RESULTS_FILE"
 echo "| Image | Taille | Build à froid | Build à chaud | TTFB | Couches |" >> "$RESULTS_FILE"
 echo "|---|---|---|---|---|---|" >> "$RESULTS_FILE"
 
-for image in "${!CONTEXTS[@]}"; do
-  context="${CONTEXTS[$image]}"
-  echo "==> $image : purge du cache de build (mesure à froid)"
-  docker builder prune -af >/dev/null
-
-  cold_ms=$(build_time "$image" "$context")
-  warm_ms=$(build_time "$image" "$context")
-  size=$(image_size_human "$image")
-  layers=$(layer_count "$image")
-
-  if [ "$image" = "todo-api" ]; then
-    port=3999
-    ttfb_ms=$(ttfb "$image" "$port" "/health")
-  else
-    port=5999
-    ttfb_ms=$(ttfb "$image" "$port" "/health")
-  fi
-
-  echo "| $image | $size | ${cold_ms}ms | ${warm_ms}ms | ${ttfb_ms}ms | $layers |" >> "$RESULTS_FILE"
-  echo "    taille=$size froid=${cold_ms}ms chaud=${warm_ms}ms ttfb=${ttfb_ms}ms couches=$layers"
-done
+measure_service "api" "todo-api:local" "http://localhost:${API_PORT:-3000}/health"
+measure_service "stats" "todo-stats:local" "http://localhost:${STATS_PORT:-5000}/health"
 
 echo ""
 echo "Résultats écrits dans $RESULTS_FILE — à recopier dans la section"
-echo "'Tableau de métriques' du README."
+echo "'Tableau de métriques' du README. La stack reste up (docker compose ps)."

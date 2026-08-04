@@ -211,8 +211,8 @@ dès le lancement du conteneur). Le script écrit ses résultats dans
 
 | Image | Taille | Build à froid | Build à chaud | TTFB | Couches |
 |---|---|---|---|---|---|
-| todo-api | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* |
-| todo-stats | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* | *voir METRICS.md* |
+| todo-api:local | 237MB | 4077ms | 834ms | 881ms | 8 |
+| todo-stats:local | 247MB | 6062ms | 867ms | 1053ms | 8 |
 
 > Exécuter `./scripts/metrics.sh` une fois (une seule commande) et recopier
 > les valeurs de `METRICS.md` ci-dessus avant la remise finale.
